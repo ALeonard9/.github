@@ -92,12 +92,43 @@ jobs:
           if [ -n "$found" ]; then shellcheck -f gcc $found || true; fi
           echo "Shellcheck complete (report-only)"
 
-      # ---------- Publish results ----------
-      - name: Upload SARIF to code scanning (public repos)
-        if: ${{ !github.event.repository.private }}
+      # ---------- Normalize SARIF (code scanning rejects undefined/null security-severity) ----------
+      - name: Normalize SARIF
+        run: |
+          for f in sarif/*.sarif; do
+            [ -f "$f" ] || continue
+            sed -i 's/"security-severity": *"undefined"/"security-severity": "0.0"/g; s/"security-severity": *"null"/"security-severity": "0.0"/g' "$f"
+          done
+
+      # ---------- Publish results: one upload per tool, distinct category ----------
+      # (CodeQL no longer allows multiple SARIF runs under the same category.)
+      - name: Upload gitleaks SARIF
+        if: ${{ !github.event.repository.private && hashFiles('sarif/gitleaks.sarif') != '' }}
         uses: github/codeql-action/upload-sarif@e58424170fb0262c8d7ed60a2e84b9bffe205c67  # v2.26.1
         with:
-          sarif_file: sarif
+          sarif_file: sarif/gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload semgrep SARIF
+        if: ${{ !github.event.repository.private && hashFiles('sarif/semgrep.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@e58424170fb0262c8d7ed60a2e84b9bffe205c67  # v2.26.1
+        with:
+          sarif_file: sarif/semgrep.sarif
+          category: semgrep
+
+      - name: Upload trivy-fs SARIF
+        if: ${{ !github.event.repository.private && hashFiles('sarif/trivy-fs.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@e58424170fb0262c8d7ed60a2e84b9bffe205c67  # v2.26.1
+        with:
+          sarif_file: sarif/trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Upload trivy-image SARIF
+        if: ${{ !github.event.repository.private && hashFiles('sarif/trivy-image.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@e58424170fb0262c8d7ed60a2e84b9bffe205c67  # v2.26.1
+        with:
+          sarif_file: sarif/trivy-image.sarif
+          category: trivy-image
 
       - name: Upload SARIF artifact (private repos)
         if: ${{ github.event.repository.private }}
