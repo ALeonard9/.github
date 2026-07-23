@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keep the reusable security workflow's action pins current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
