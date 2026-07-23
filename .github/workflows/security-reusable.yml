@@ -1,0 +1,155 @@
+name: security-reusable
+
+# Reusable OSS security pipeline for the druthers-* repos.
+# Callers invoke this via `uses: ALeonard9/.github/.github/workflows/security-reusable.yml@main`.
+# Tools: gitleaks (secrets) · semgrep CE (SAST) · trivy (SCA/container/IaC) · shellcheck.
+# Output: public repos -> GitHub code scanning (Security tab); private -> SARIF artifact.
+# Gate: non-blocking until `block: true`, then fails on secrets or CRITICAL/HIGH.
+# Alert: on push to main, opens a deduped `security` / `priority:p1` issue on criticals.
+
+on:
+  workflow_call:
+    inputs:
+      stack:        { type: string,  default: "none" }        # python | node | none
+      builds_image: { type: boolean, default: false }
+      shellcheck:   { type: boolean, default: false }
+      block:        { type: boolean, default: false }         # true = fail PR on findings
+      severity:     { type: string,  default: "CRITICAL,HIGH" }
+
+permissions:
+  contents: read
+  security-events: write   # SARIF upload to code scanning (public repos)
+  issues: write            # critical -> alert issue
+  actions: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Prepare
+        run: mkdir -p sarif
+
+      # ---------- Secrets: gitleaks (full history) ----------
+      - name: Gitleaks (secrets)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --log-opts="--all" --redact \
+            --report-format=sarif --report-path=/repo/sarif/gitleaks.sarif --exit-code=0 || true
+          n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif 2>/dev/null || echo 0)
+          echo "GITLEAKS_COUNT=$n" >> "$GITHUB_ENV"
+          echo "Gitleaks findings: $n"
+          if [ "${{ inputs.block }}" = "true" ] && [ "$n" -gt 0 ]; then
+            echo "::error::$n secret(s) detected"; exit 1
+          fi
+
+      # ---------- SAST: semgrep CE (report-only) ----------
+      - name: Semgrep (SAST)
+        if: inputs.stack != 'none'
+        run: |
+          python3 -m pip install --quiet semgrep
+          semgrep scan --config p/default --config p/security-audit \
+            --sarif --output sarif/semgrep.sarif --error=false --quiet || true
+          echo "Semgrep complete"
+
+      # ---------- SCA + IaC + secrets: trivy fs (informational SARIF) ----------
+      - name: Trivy fs (SCA/IaC)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: sarif/trivy-fs.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      # ---------- Container: build + trivy image ----------
+      - name: Build image
+        if: inputs.builds_image
+        run: docker build -t "local/scan:${{ github.sha }}" .
+
+      - name: Trivy image
+        if: inputs.builds_image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: image
+          image-ref: "local/scan:${{ github.sha }}"
+          format: sarif
+          output: sarif/trivy-image.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+          exit-code: "0"
+
+      # ---------- Shellcheck (infra bash) ----------
+      - name: Shellcheck
+        if: inputs.shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          found=$(find . -name '*.sh' -not -path './.git/*')
+          if [ -n "$found" ]; then shellcheck -f gcc $found || true; fi
+          echo "Shellcheck complete (report-only)"
+
+      # ---------- Publish results ----------
+      - name: Upload SARIF to code scanning (public repos)
+        if: ${{ !github.event.repository.private }}
+        uses: github/codeql-action/upload-sarif@e58424170fb0262c8d7ed60a2e84b9bffe205c67  # v2.26.1
+        with:
+          sarif_file: sarif
+
+      - name: Upload SARIF artifact (private repos)
+        if: ${{ github.event.repository.private }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: security-sarif
+          path: sarif/
+
+      # ---------- PR gate (blocking only when block=true) ----------
+      - name: Gate — Trivy CRITICAL/HIGH
+        if: inputs.block
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: "${{ inputs.severity }}"
+          format: table
+          exit-code: "1"
+
+      - name: Gate — Trivy image CRITICAL/HIGH
+        if: ${{ inputs.block && inputs.builds_image }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: image
+          image-ref: "local/scan:${{ github.sha }}"
+          severity: "${{ inputs.severity }}"
+          format: table
+          exit-code: "1"
+
+      # ---------- Alert: critical on main -> deduped issue ----------
+      - name: Alert on critical (main only)
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          crit=0
+          for f in sarif/trivy-fs.sarif sarif/trivy-image.sarif; do
+            [ -f "$f" ] || continue
+            c=$(jq '[.runs[].results[] | select(((.properties["security-severity"] // "0") | tonumber) >= 7.0)] | length' "$f" 2>/dev/null || echo 0)
+            crit=$((crit + c))
+          done
+          total=$((crit + ${GITLEAKS_COUNT:-0}))
+          echo "Critical/high total on main: $total"
+          [ "$total" -eq 0 ] && exit 0
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --label security --state open --json number -q 'length' 2>/dev/null || echo 0)
+          if [ "$existing" = "0" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --label security --label priority:p1 \
+              --title "🔴 Security: $total critical/high finding(s) on main" \
+              --body "Automated alert from the security workflow (commit \`${GITHUB_SHA}\`). $total CRITICAL/HIGH finding(s) across SCA/IaC/container/secrets. See the **Security → Code scanning** tab (public repos) or the run's SARIF artifact (private). Close this once triaged." \
+            && echo "Opened alert issue"
+          else
+            echo "An open 'security' issue already exists — not duplicating."
+          fi
