@@ -165,10 +165,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Trivy maps CRITICAL/HIGH -> SARIF level "error" (severity lives on the
+          # rule, not the result, so count by level instead of security-severity).
           crit=0
           for f in sarif/trivy-fs.sarif sarif/trivy-image.sarif; do
             [ -f "$f" ] || continue
-            c=$(jq '[.runs[].results[] | select(((.properties["security-severity"] // "0") | tonumber) >= 7.0)] | length' "$f" 2>/dev/null || echo 0)
+            c=$(jq '[.runs[].results[] | select(.level == "error")] | length' "$f" 2>/dev/null || echo 0)
             crit=$((crit + c))
           done
           total=$((crit + ${GITLEAKS_COUNT:-0}))
@@ -177,8 +179,8 @@ jobs:
           existing=$(gh issue list -R "$GITHUB_REPOSITORY" --label security --state open --json number -q 'length' 2>/dev/null || echo 0)
           if [ "$existing" = "0" ]; then
             gh issue create -R "$GITHUB_REPOSITORY" \
-              --label security --label priority:p1 \
-              --title "🔴 Security: $total critical/high finding(s) on main" \
+              --label security \
+              --title "🔴 [p1] Security: $total critical/high finding(s) on main" \
               --body "Automated alert from the security workflow (commit \`${GITHUB_SHA}\`). $total CRITICAL/HIGH finding(s) across SCA/IaC/container/secrets. See the **Security → Code scanning** tab (public repos) or the run's SARIF artifact (private). Close this once triaged." \
             && echo "Opened alert issue"
           else
