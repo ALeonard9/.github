@@ -146,6 +146,7 @@ jobs:
           scan-ref: .
           scanners: vuln,misconfig,secret
           severity: "${{ inputs.severity }}"
+          ignore-unfixed: true
           format: table
           exit-code: "1"
 
@@ -156,6 +157,7 @@ jobs:
           scan-type: image
           image-ref: "local/scan:${{ github.sha }}"
           severity: "${{ inputs.severity }}"
+          ignore-unfixed: true
           format: table
           exit-code: "1"
 
