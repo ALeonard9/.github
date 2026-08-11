@@ -138,6 +138,18 @@ jobs:
           path: sarif/
 
       # ---------- PR gate (blocking only when block=true) ----------
+      # The informational scans above already analyzed these same targets (fs
+      # scan-ref `.`, image `local/scan:<sha>`). Trivy's on-disk artifact cache
+      # (TRIVY_CACHE_DIR) can serve a stale analysis when the same target is
+      # scanned twice in one job — observed blocking a dependency-fix PR on
+      # exactly the vulnerable versions the fix had just replaced, confirmed by
+      # a clean rerun reproducing the same stale result (ALeonard9/.github#6).
+      # Clearing only the scan-result cache (not the vuln DB) forces a fresh
+      # read without paying to re-download the database.
+      - name: Clear Trivy scan-result cache before gate
+        if: inputs.block
+        run: trivy clean --scan-cache || true
+
       - name: Gate — Trivy CRITICAL/HIGH
         if: inputs.block
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
