@@ -193,7 +193,7 @@ jobs:
           path: sarif/
 
       # ---------- PR gate (blocking only when block=true) ----------
-      - name: Gate — Trivy CRITICAL/HIGH
+      - name: Gate - Trivy CRITICAL/HIGH
         if: inputs.block
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -205,7 +205,7 @@ jobs:
           format: table
           exit-code: "1"
 
-      - name: Gate — Trivy image CRITICAL/HIGH
+      - name: Gate - Trivy image CRITICAL/HIGH
         if: ${{ inputs.block && inputs.builds_image }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -241,5 +241,5 @@ jobs:
               --body "Automated alert from the security workflow (commit \`${GITHUB_SHA}\`). $total CRITICAL/HIGH finding(s) across SCA/IaC/container/secrets. See the **Security → Code scanning** tab (public repos) or the run's SARIF artifact (private). Close this once triaged." \
             && echo "Opened alert issue"
           else
-            echo "An open 'security' issue already exists — not duplicating."
+            echo "An open 'security' issue already exists - not duplicating."
           fi
