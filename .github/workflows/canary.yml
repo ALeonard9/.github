@@ -65,15 +65,23 @@ jobs:
           fi
 
       # ---------- trivy must find a planted vulnerable dependency ----------
+      # Via the same SHA-pinned action the real pipeline uses, not a bare
+      # `trivy` call: the runner has no trivy binary, and going through the
+      # action means the canary exercises the same code path production does.
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: canary/
+          scanners: vuln
+          format: json
+          output: trivy-canary.json
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
       - name: Trivy finds a planted vulnerable dependency
         run: |
-          # --file-patterns for the same reason the real pipeline needs it: the
-          # pip analyzer only recognises a file named requirements.txt. The
-          # fixture is named exactly that, so this also proves the plain path.
-          trivy fs --scanners vuln --severity CRITICAL,HIGH \
-            --format json --output /tmp/trivy.json --skip-version-check canary/
-
-          n=$(jq '[.Results[]? | .Vulnerabilities[]?] | length' /tmp/trivy.json)
+          n=$(jq '[.Results[]? | .Vulnerabilities[]?] | length' trivy-canary.json)
           echo "Trivy found $n planted vulnerability(ies)"
           if [ "$n" -lt 1 ]; then
             echo "::error::trivy found nothing in canary/requirements.txt (PyYAML==5.1 has 3 known criticals)."
