@@ -15,18 +15,16 @@ name: canary
 # runs when it changes. This is the CI that repo never had.
 
 on:
+  # Deliberately no `paths:` filter. This job is a required status check on
+  # main, and a required check that is skipped never reports at all: the PR
+  # then waits forever on a check that will never arrive. A path filter would
+  # do exactly that to any PR touching only README.md or SECURITY.md. The repo
+  # holds five files and sees a handful of PRs, so running the full canary on
+  # every one costs about a minute and removes the trap entirely.
   push:
     branches: [main]
-    paths:
-      - '.github/workflows/security-reusable.yml'
-      - '.github/workflows/canary.yml'
-      - 'canary/**'
   pull_request:
     branches: [main]
-    paths:
-      - '.github/workflows/security-reusable.yml'
-      - '.github/workflows/canary.yml'
-      - 'canary/**'
   # Rules and CVE feeds move underneath us, so run even when nothing changed.
   schedule:
     - cron: "0 7 * * 1"
