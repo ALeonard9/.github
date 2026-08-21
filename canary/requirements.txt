@@ -1,0 +1,3 @@
+# Deliberately vulnerable pin. See README.md in this directory.
+# Nothing installs this; it exists so trivy has a known finding to detect.
+PyYAML==5.1
