@@ -105,5 +105,28 @@ jobs:
             exit 1
           fi
 
+          # The severity gate in security-reusable.yml resolves severity through
+          # rule.defaultConfiguration.level in the SARIF, which is the only place
+          # semgrep records it. Exercise that same path here: subprocess-shell-true
+          # is an error-level rule, so a gate that resolves severity correctly sees
+          # at least one. A gate reading the wrong field counts zero and lets every
+          # finding through, so assert on the resolution, not just on the count.
+          semgrep scan --config p/default --config p/security-audit \
+            --sarif --output /tmp/semgrep.sarif --quiet canary/
+          err=$(jq '[ .runs[] as $r
+                      | $r.results[]
+                      | select((.suppressions // []) | length == 0)
+                      | .ruleId as $id
+                      | select([ $r.tool.driver.rules[]?
+                                 | select(.id == $id)
+                                 | .defaultConfiguration.level ][0] == "error") ] | length' \
+                  /tmp/semgrep.sarif)
+          echo "Semgrep error-level findings: $err"
+          if [ "$err" -lt 1 ]; then
+            echo "::error::severity resolution is broken: canary/vulnerable.py has an"
+            echo "::error::error-level rule (subprocess-shell-true) but the gate query found none."
+            exit 1
+          fi
+
       - name: Summary
         run: echo "All three scanners detected their planted findings."
