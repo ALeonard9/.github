@@ -15,6 +15,10 @@ on:
       shellcheck:   { type: boolean, default: false }
       block:        { type: boolean, default: false }         # true = fail PR on findings
       severity:     { type: string,  default: "CRITICAL,HIGH" }
+      # Extra trivy --file-patterns, e.g. 'pip:requirements/.*\.txt'. Trivy's
+      # pip analyzer only recognises a file literally named requirements.txt,
+      # so a repo keeping deps anywhere else scans zero packages without this.
+      file_patterns: { type: string, default: "" }
 
 permissions:
   contents: read
@@ -25,6 +29,8 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      TRIVY_FILE_PATTERNS: ${{ inputs.file_patterns }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -51,9 +57,24 @@ jobs:
         if: inputs.stack != 'none'
         run: |
           python3 -m pip install --quiet semgrep
+          # Report-only is the default: semgrep exits 0 on findings unless
+          # --error is passed. It is a flag, so the `--error=false` this step
+          # used to carry was a usage error, and semgrep exited 2 before
+          # scanning anything. `|| true` hid that, the SARIF was never written,
+          # the upload below was skipped on its hashFiles() guard, and the step
+          # still printed "Semgrep complete". SAST reported nothing for a month
+          # while every run stayed green. Do not reintroduce a blanket `|| true`
+          # here without keeping the SARIF check that follows.
+          rc=0
           semgrep scan --config p/default --config p/security-audit \
-            --sarif --output sarif/semgrep.sarif --error=false --quiet || true
-          echo "Semgrep complete"
+            --sarif --output sarif/semgrep.sarif --quiet || rc=$?
+          if [ "$rc" -ne 0 ] || [ ! -s sarif/semgrep.sarif ]; then
+            echo "::error::Semgrep produced no SARIF report (exit $rc) - SAST did not run"
+            if [ "${{ inputs.block }}" = "true" ]; then exit 1; fi
+            exit 0
+          fi
+          n=$(jq '[.runs[].results[]] | length' sarif/semgrep.sarif 2>/dev/null || echo 0)
+          echo "Semgrep findings: $n"
 
       # ---------- SCA + IaC + secrets: trivy fs (informational SARIF) ----------
       - name: Trivy fs (SCA/IaC)
@@ -66,6 +87,24 @@ jobs:
           output: sarif/trivy-fs.sarif
           severity: CRITICAL,HIGH,MEDIUM
           exit-code: "0"
+
+      # ---------- Guard: prove the SCA leg actually matched a manifest ----------
+      # trivy exits 0 and reports "0 language-specific files" when it recognises
+      # no dependency file, which is indistinguishable from a clean scan in the
+      # check UI. For a repo that declares a stack, no packages means the scan
+      # covers nothing and the green tick is meaningless.
+      - name: Verify SCA matched dependency manifests
+        if: inputs.stack != 'none'
+        run: |
+          pkgs=$(trivy fs --scanners vuln --format json --list-all-pkgs \
+            --skip-version-check . 2>/dev/null \
+            | jq '[.Results[]? | select(.Class=="lang-pkgs") | .Packages | length] | add // 0')
+          echo "Dependency packages seen by trivy: $pkgs"
+          if [ "${pkgs:-0}" -eq 0 ]; then
+            echo "::error::trivy matched no dependency manifest for stack '${{ inputs.stack }}'"
+            echo "::error::Pass file_patterns to this workflow, e.g. 'pip:requirements/.*\.txt'"
+            exit 1
+          fi
 
       # ---------- Container: build + trivy image ----------
       - name: Build image
