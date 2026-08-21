@@ -42,10 +42,26 @@ jobs:
       # ---------- Secrets: gitleaks (full history) ----------
       - name: Gitleaks (secrets)
         run: |
+          # --exit-code=0 means gitleaks returns 0 even when it finds secrets,
+          # so the count below is the gate, not the exit status. A non-zero rc
+          # therefore means gitleaks genuinely failed to run (image pull, docker
+          # daemon, bad args). That case must not be confused with "no secrets":
+          # without the report check below, a crashed scanner writes no SARIF,
+          # jq falls back to 0, and the step reports "Gitleaks findings: 0" and
+          # passes the block gate. Same shape as the semgrep bug fixed alongside
+          # this. Gitleaks writes a report even on a clean scan, so a missing or
+          # empty file means it did not run.
+          rc=0
           docker run --rm -v "${{ github.workspace }}:/repo" zricethezav/gitleaks:latest \
             detect --source=/repo --log-opts="--all" --redact \
-            --report-format=sarif --report-path=/repo/sarif/gitleaks.sarif --exit-code=0 || true
-          n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif 2>/dev/null || echo 0)
+            --report-format=sarif --report-path=/repo/sarif/gitleaks.sarif --exit-code=0 || rc=$?
+          if [ "$rc" -ne 0 ] || [ ! -s sarif/gitleaks.sarif ]; then
+            echo "::error::Gitleaks produced no report (exit $rc) - secret scanning did not run"
+            if [ "${{ inputs.block }}" = "true" ]; then exit 1; fi
+            echo "GITLEAKS_COUNT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif)
           echo "GITLEAKS_COUNT=$n" >> "$GITHUB_ENV"
           echo "Gitleaks findings: $n"
           if [ "${{ inputs.block }}" = "true" ] && [ "$n" -gt 0 ]; then
