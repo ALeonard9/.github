@@ -94,8 +94,34 @@ jobs:
             if [ "${{ inputs.block }}" = "true" ]; then exit 1; fi
             exit 0
           fi
-          n=$(jq '[.runs[].results[]] | length' sarif/semgrep.sarif 2>/dev/null || echo 0)
+          # SARIF keeps suppressed findings and flags them, unlike --json which
+          # drops them. Counting without this filter reports every `# nosemgrep`
+          # line as an open finding.
+          n=$(jq '[.runs[].results[] | select((.suppressions // []) | length == 0)] | length' \
+                sarif/semgrep.sarif 2>/dev/null || echo 0)
           echo "Semgrep findings: $n"
+
+          # Severity lives on the rule, and nowhere else. Semgrep SARIF results
+          # carry no `level`, and unlike CodeQL its rules carry no
+          # security-severity property, so the only source is
+          # rule.defaultConfiguration.level. Gating on either of the other two
+          # fields matches nothing and counts zero on every run, which is
+          # indistinguishable from a clean scan.
+          err=$(jq '[ .runs[] as $r
+                      | $r.results[]
+                      | select((.suppressions // []) | length == 0)
+                      | .ruleId as $id
+                      | select([ $r.tool.driver.rules[]?
+                                 | select(.id == $id)
+                                 | .defaultConfiguration.level ][0] == "error") ] | length' \
+                  sarif/semgrep.sarif 2>/dev/null || echo 0)
+          echo "Semgrep error-level findings: $err"
+          if [ "${{ inputs.block }}" = "true" ] \
+             && [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "$err" -gt 0 ]; then
+            echo "::error::$err error-level semgrep finding(s). See the Security tab."
+            exit 1
+          fi
 
       # ---------- SCA + IaC + container: trivy ----------
       # Scanned once per target, to JSON, then `trivy convert` renders the
