@@ -1,0 +1,103 @@
+name: canary
+
+# Proves the three scanners in security-reusable.yml can still find something.
+#
+# A scanner that has silently stopped working is indistinguishable from a clean
+# scan: both report zero findings and exit 0. Asserting "no findings" is
+# therefore satisfied just as well by a dead scanner as by a working one, which
+# is how semgrep went a month without running while every check stayed green.
+#
+# This job asserts the opposite direction. Each scanner is pointed at a fixture
+# holding a known planted finding and must report it. If a scanner reports
+# nothing, the scanner is broken, not the fixture.
+#
+# security-reusable.yml only triggers on workflow_call, so nothing in this repo
+# runs when it changes. This is the CI that repo never had.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/security-reusable.yml'
+      - '.github/workflows/canary.yml'
+      - 'canary/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/security-reusable.yml'
+      - '.github/workflows/canary.yml'
+      - 'canary/**'
+  # Rules and CVE feeds move underneath us, so run even when nothing changed.
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      # ---------- gitleaks must find a planted credential ----------
+      # Generated here, never committed: a credential-shaped string in git would
+      # trip push protection, and AWS's documented example key is allowlisted by
+      # gitleaks, so it would prove nothing.
+      - name: Gitleaks finds a planted secret
+        run: |
+          work=$(mktemp -d)
+          key="AKIA$(LC_ALL=C tr -dc 'A-Z0-9' < /dev/urandom | head -c 16)"
+          secret="$(LC_ALL=C tr -dc 'A-Za-z0-9/+' < /dev/urandom | head -c 40)"
+          printf 'aws_access_key_id = %s\naws_secret_access_key = %s\n' \
+            "$key" "$secret" > "$work/creds.txt"
+
+          docker run --rm -v "$work:/scan" zricethezav/gitleaks:latest \
+            detect --source=/scan --no-git --redact \
+            --report-format=json --report-path=/scan/out.json --exit-code=0 || true
+
+          n=$(jq 'length' "$work/out.json" 2>/dev/null || echo 0)
+          echo "Gitleaks found $n planted secret(s)"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::gitleaks found no planted credential. Secret scanning is broken."
+            exit 1
+          fi
+
+      # ---------- trivy must find a planted vulnerable dependency ----------
+      - name: Trivy finds a planted vulnerable dependency
+        run: |
+          # --file-patterns for the same reason the real pipeline needs it: the
+          # pip analyzer only recognises a file named requirements.txt. The
+          # fixture is named exactly that, so this also proves the plain path.
+          trivy fs --scanners vuln --severity CRITICAL,HIGH \
+            --format json --output /tmp/trivy.json --skip-version-check canary/
+
+          n=$(jq '[.Results[]? | .Vulnerabilities[]?] | length' /tmp/trivy.json)
+          echo "Trivy found $n planted vulnerability(ies)"
+          if [ "$n" -lt 1 ]; then
+            echo "::error::trivy found nothing in canary/requirements.txt (PyYAML==5.1 has 3 known criticals)."
+            echo "::error::Either the SCA leg is broken or it matched no dependency file at all."
+            exit 1
+          fi
+
+      # ---------- semgrep must find planted dangerous code ----------
+      - name: Semgrep finds planted dangerous code
+        run: |
+          python3 -m pip install --quiet semgrep
+          # No --error: report-only, exactly as the real pipeline runs it, so a
+          # usage error here fails for the same reason it would fail there.
+          semgrep scan --config p/default --config p/security-audit \
+            --json --output /tmp/semgrep.json --quiet canary/
+
+          n=$(jq '[.results[]?] | length' /tmp/semgrep.json 2>/dev/null || echo 0)
+          echo "Semgrep found $n planted issue(s)"
+          jq -r '[.results[]?.check_id] | unique[]' /tmp/semgrep.json 2>/dev/null || true
+          if [ "$n" -lt 1 ]; then
+            echo "::error::semgrep found nothing in canary/vulnerable.py (shell=True and eval are both present)."
+            echo "::error::SAST is not running. Check that semgrep produced a report at all."
+            exit 1
+          fi
+
+      - name: Summary
+        run: echo "All three scanners detected their planted findings."
