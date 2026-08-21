@@ -15,6 +15,10 @@ on:
       shellcheck:   { type: boolean, default: false }
       block:        { type: boolean, default: false }         # true = fail PR on findings
       severity:     { type: string,  default: "CRITICAL,HIGH" }
+      # Extra trivy --file-patterns, e.g. 'pip:requirements/.*\.txt'. Trivy's
+      # pip analyzer only recognises a file literally named requirements.txt,
+      # so a repo keeping deps anywhere else scans zero packages without this.
+      file_patterns: { type: string, default: "" }
 
 permissions:
   contents: read
@@ -25,6 +29,8 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      TRIVY_FILE_PATTERNS: ${{ inputs.file_patterns }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -36,10 +42,26 @@ jobs:
       # ---------- Secrets: gitleaks (full history) ----------
       - name: Gitleaks (secrets)
         run: |
+          # --exit-code=0 means gitleaks returns 0 even when it finds secrets,
+          # so the count below is the gate, not the exit status. A non-zero rc
+          # therefore means gitleaks genuinely failed to run (image pull, docker
+          # daemon, bad args). That case must not be confused with "no secrets":
+          # without the report check below, a crashed scanner writes no SARIF,
+          # jq falls back to 0, and the step reports "Gitleaks findings: 0" and
+          # passes the block gate. Same shape as the semgrep bug fixed alongside
+          # this. Gitleaks writes a report even on a clean scan, so a missing or
+          # empty file means it did not run.
+          rc=0
           docker run --rm -v "${{ github.workspace }}:/repo" zricethezav/gitleaks:latest \
             detect --source=/repo --log-opts="--all" --redact \
-            --report-format=sarif --report-path=/repo/sarif/gitleaks.sarif --exit-code=0 || true
-          n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif 2>/dev/null || echo 0)
+            --report-format=sarif --report-path=/repo/sarif/gitleaks.sarif --exit-code=0 || rc=$?
+          if [ "$rc" -ne 0 ] || [ ! -s sarif/gitleaks.sarif ]; then
+            echo "::error::Gitleaks produced no report (exit $rc) - secret scanning did not run"
+            if [ "${{ inputs.block }}" = "true" ]; then exit 1; fi
+            echo "GITLEAKS_COUNT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif)
           echo "GITLEAKS_COUNT=$n" >> "$GITHUB_ENV"
           echo "Gitleaks findings: $n"
           if [ "${{ inputs.block }}" = "true" ] && [ "$n" -gt 0 ]; then
@@ -51,9 +73,24 @@ jobs:
         if: inputs.stack != 'none'
         run: |
           python3 -m pip install --quiet semgrep
+          # Report-only is the default: semgrep exits 0 on findings unless
+          # --error is passed. It is a flag, so the `--error=false` this step
+          # used to carry was a usage error, and semgrep exited 2 before
+          # scanning anything. `|| true` hid that, the SARIF was never written,
+          # the upload below was skipped on its hashFiles() guard, and the step
+          # still printed "Semgrep complete". SAST reported nothing for a month
+          # while every run stayed green. Do not reintroduce a blanket `|| true`
+          # here without keeping the SARIF check that follows.
+          rc=0
           semgrep scan --config p/default --config p/security-audit \
-            --sarif --output sarif/semgrep.sarif --error=false --quiet || true
-          echo "Semgrep complete"
+            --sarif --output sarif/semgrep.sarif --quiet || rc=$?
+          if [ "$rc" -ne 0 ] || [ ! -s sarif/semgrep.sarif ]; then
+            echo "::error::Semgrep produced no SARIF report (exit $rc) - SAST did not run"
+            if [ "${{ inputs.block }}" = "true" ]; then exit 1; fi
+            exit 0
+          fi
+          n=$(jq '[.runs[].results[]] | length' sarif/semgrep.sarif 2>/dev/null || echo 0)
+          echo "Semgrep findings: $n"
 
       # ---------- SCA + IaC + secrets: trivy fs (informational SARIF) ----------
       - name: Trivy fs (SCA/IaC)
@@ -66,6 +103,24 @@ jobs:
           output: sarif/trivy-fs.sarif
           severity: CRITICAL,HIGH,MEDIUM
           exit-code: "0"
+
+      # ---------- Guard: prove the SCA leg actually matched a manifest ----------
+      # trivy exits 0 and reports "0 language-specific files" when it recognises
+      # no dependency file, which is indistinguishable from a clean scan in the
+      # check UI. For a repo that declares a stack, no packages means the scan
+      # covers nothing and the green tick is meaningless.
+      - name: Verify SCA matched dependency manifests
+        if: inputs.stack != 'none'
+        run: |
+          pkgs=$(trivy fs --scanners vuln --format json --list-all-pkgs \
+            --skip-version-check . 2>/dev/null \
+            | jq '[.Results[]? | select(.Class=="lang-pkgs") | .Packages | length] | add // 0')
+          echo "Dependency packages seen by trivy: $pkgs"
+          if [ "${pkgs:-0}" -eq 0 ]; then
+            echo "::error::trivy matched no dependency manifest for stack '${{ inputs.stack }}'"
+            echo "::error::Pass file_patterns to this workflow, e.g. 'pip:requirements/.*\.txt'"
+            exit 1
+          fi
 
       # ---------- Container: build + trivy image ----------
       - name: Build image
@@ -138,7 +193,7 @@ jobs:
           path: sarif/
 
       # ---------- PR gate (blocking only when block=true) ----------
-      - name: Gate — Trivy CRITICAL/HIGH
+      - name: Gate - Trivy CRITICAL/HIGH
         if: inputs.block
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -150,7 +205,7 @@ jobs:
           format: table
           exit-code: "1"
 
-      - name: Gate — Trivy image CRITICAL/HIGH
+      - name: Gate - Trivy image CRITICAL/HIGH
         if: ${{ inputs.block && inputs.builds_image }}
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
@@ -186,5 +241,5 @@ jobs:
               --body "Automated alert from the security workflow (commit \`${GITHUB_SHA}\`). $total CRITICAL/HIGH finding(s) across SCA/IaC/container/secrets. See the **Security → Code scanning** tab (public repos) or the run's SARIF artifact (private). Close this once triaged." \
             && echo "Opened alert issue"
           else
-            echo "An open 'security' issue already exists — not duplicating."
+            echo "An open 'security' issue already exists - not duplicating."
           fi
