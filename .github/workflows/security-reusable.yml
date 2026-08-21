@@ -64,7 +64,12 @@ jobs:
           n=$(jq '[.runs[].results[]] | length' sarif/gitleaks.sarif)
           echo "GITLEAKS_COUNT=$n" >> "$GITHUB_ENV"
           echo "Gitleaks findings: $n"
-          if [ "${{ inputs.block }}" = "true" ] && [ "$n" -gt 0 ]; then
+          # Gate on PRs only. On a push the merge already happened, so
+          # failing here just paints main red; the alert step at the end of
+          # this job opens a tracking issue instead.
+          if [ "${{ inputs.block }}" = "true" ] \
+             && [ "${{ github.event_name }}" = "pull_request" ] \
+             && [ "$n" -gt 0 ]; then
             echo "::error::$n secret(s) detected"; exit 1
           fi
 
@@ -92,17 +97,28 @@ jobs:
           n=$(jq '[.runs[].results[]] | length' sarif/semgrep.sarif 2>/dev/null || echo 0)
           echo "Semgrep findings: $n"
 
-      # ---------- SCA + IaC + secrets: trivy fs (informational SARIF) ----------
+      # ---------- SCA + IaC + container: trivy ----------
+      # Scanned once per target, to JSON, then `trivy convert` renders the
+      # SARIF from that same result. The gate reads the JSON. Previously the
+      # gate steps re-ran trivy over targets that had just been scanned, which
+      # cost 38s a run for no new information.
+      #
+      # JSON rather than SARIF as the source of truth because it carries
+      # FixedVersion. That is what lets the gate keep ignore-unfixed semantics:
+      # block on what can actually be fixed, while the uploaded SARIF still
+      # shows unfixable findings in the Security tab.
+      - name: Install trivy
+        uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514  # v0.2.3
+
       - name: Trivy fs (SCA/IaC)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,misconfig,secret
-          format: sarif
-          output: sarif/trivy-fs.sarif
-          severity: CRITICAL,HIGH,MEDIUM
-          exit-code: "0"
+        run: |
+          # --list-all-pkgs so the manifest guard below reads this same result
+          # instead of running its own scan.
+          trivy fs --scanners vuln,misconfig,secret \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --format json --output trivy-fs.json \
+            --list-all-pkgs --exit-code 0 --skip-version-check .
+          trivy convert --format sarif --output sarif/trivy-fs.sarif trivy-fs.json
 
       # ---------- Guard: prove the SCA leg actually matched a manifest ----------
       # trivy exits 0 and reports "0 language-specific files" when it recognises
@@ -112,9 +128,7 @@ jobs:
       - name: Verify SCA matched dependency manifests
         if: inputs.stack != 'none'
         run: |
-          pkgs=$(trivy fs --scanners vuln --format json --list-all-pkgs \
-            --skip-version-check . 2>/dev/null \
-            | jq '[.Results[]? | select(.Class=="lang-pkgs") | .Packages | length] | add // 0')
+          pkgs=$(jq '[.Results[]? | select(.Class=="lang-pkgs") | .Packages | length] | add // 0' trivy-fs.json)
           echo "Dependency packages seen by trivy: $pkgs"
           if [ "${pkgs:-0}" -eq 0 ]; then
             echo "::error::trivy matched no dependency manifest for stack '${{ inputs.stack }}'"
@@ -129,14 +143,12 @@ jobs:
 
       - name: Trivy image
         if: inputs.builds_image
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        with:
-          scan-type: image
-          image-ref: "local/scan:${{ github.sha }}"
-          format: sarif
-          output: sarif/trivy-image.sarif
-          severity: CRITICAL,HIGH,MEDIUM
-          exit-code: "0"
+        run: |
+          trivy image --scanners vuln \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --format json --output trivy-image.json \
+            --exit-code 0 --skip-version-check "local/scan:${{ github.sha }}"
+          trivy convert --format sarif --output sarif/trivy-image.sarif trivy-image.json
 
       # ---------- Shellcheck (infra bash) ----------
       - name: Shellcheck
@@ -192,29 +204,30 @@ jobs:
           name: security-sarif
           path: sarif/
 
-      # ---------- PR gate (blocking only when block=true) ----------
-      - name: Gate - Trivy CRITICAL/HIGH
-        if: inputs.block
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,misconfig,secret
-          severity: "${{ inputs.severity }}"
-          ignore-unfixed: true
-          format: table
-          exit-code: "1"
-
-      - name: Gate - Trivy image CRITICAL/HIGH
-        if: ${{ inputs.block && inputs.builds_image }}
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
-        with:
-          scan-type: image
-          image-ref: "local/scan:${{ github.sha }}"
-          severity: "${{ inputs.severity }}"
-          ignore-unfixed: true
-          format: table
-          exit-code: "1"
+      # ---------- PR gate ----------
+      # PRs only: on a push the merge already happened, so failing here just
+      # paints main red. The alert step below is what covers main.
+      #
+      # Reads the JSON from the scans above rather than re-scanning. Blocks on
+      # fixable CRITICAL/HIGH only, matching the ignore-unfixed behaviour the
+      # two separate gate steps used to have.
+      - name: Gate - fixable CRITICAL/HIGH
+        if: ${{ inputs.block && github.event_name == 'pull_request' }}
+        run: |
+          total=0
+          for f in trivy-fs.json trivy-image.json; do
+            [ -f "$f" ] || continue
+            n=$(jq '[.Results[]?.Vulnerabilities[]?
+                     | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+                     | select((.FixedVersion // "") != "")] | length' "$f")
+            echo "$f: $n fixable CRITICAL/HIGH"
+            total=$((total + n))
+          done
+          if [ "$total" -gt 0 ]; then
+            echo "::error::$total fixable CRITICAL/HIGH finding(s). See the Security tab for detail."
+            exit 1
+          fi
+          echo "No fixable CRITICAL/HIGH findings."
 
       # ---------- Alert: critical on main -> deduped issue ----------
       - name: Alert on critical (main only)
